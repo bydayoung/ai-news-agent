@@ -48,8 +48,11 @@ KEYWORDS = [
 # 검색어별 최대 수집 개수
 NEWS_PER_KEYWORD = 8
 
-# Slack에 보낼 뉴스 개수
+# Slack에 보낼 최대 뉴스 개수
 MAX_SELECTED_NEWS = 5
+
+# 동일 카테고리 최대 개수
+MAX_NEWS_PER_CATEGORY = 3
 
 # 최근 며칠 기사까지 볼지
 LOOKBACK_DAYS = 7
@@ -80,25 +83,41 @@ def normalize_title(title):
     """중복 비교를 위한 제목 정규화"""
 
     title = title.lower()
-    title = re.sub(r"[^가-힣a-z0-9\s]", "", title)
-    title = re.sub(r"\s+", " ", title)
+    title = re.sub(
+        r"[^가-힣a-z0-9\s]",
+        "",
+        title,
+    )
+    title = re.sub(
+        r"\s+",
+        " ",
+        title,
+    )
 
     return title.strip()
 
 
-def shorten_title(title, max_length=MAX_TITLE_LENGTH):
+def shorten_title(
+    title,
+    max_length=MAX_TITLE_LENGTH,
+):
     """Slack에서 너무 긴 제목 축약"""
 
     if len(title) <= max_length:
         return title
 
-    return title[:max_length].rstrip() + "..."
+    return (
+        title[:max_length].rstrip()
+        + "..."
+    )
 
 
 def format_published_date(article):
     """timestamp를 YYYY-MM-DD 형식으로 변환"""
 
-    timestamp = article.get("published_timestamp")
+    timestamp = article.get(
+        "published_timestamp"
+    )
 
     if not timestamp:
         return "발행일 정보 없음"
@@ -114,7 +133,9 @@ def format_published_date(article):
 # =========================================================
 
 def get_google_news(keyword):
-    encoded_keyword = quote_plus(keyword)
+    encoded_keyword = quote_plus(
+        keyword
+    )
 
     url = (
         "https://news.google.com/rss/search"
@@ -132,19 +153,31 @@ def get_google_news(keyword):
 
     cutoff = (
         current_time
-        - (LOOKBACK_DAYS * 24 * 60 * 60)
+        - (
+            LOOKBACK_DAYS
+            * 24
+            * 60
+            * 60
+        )
     )
 
     for entry in feed.entries:
         published_timestamp = None
 
         # 최근 LOOKBACK_DAYS 이내 기사만 사용
-        if entry.get("published_parsed"):
-            published_timestamp = calendar.timegm(
-                entry.published_parsed
+        if entry.get(
+            "published_parsed"
+        ):
+            published_timestamp = (
+                calendar.timegm(
+                    entry.published_parsed
+                )
             )
 
-            if published_timestamp < cutoff:
+            if (
+                published_timestamp
+                < cutoff
+            ):
                 continue
 
         source = ""
@@ -156,7 +189,10 @@ def get_google_news(keyword):
             )
 
         title = clean_title(
-            entry.get("title", ""),
+            entry.get(
+                "title",
+                "",
+            ),
             source,
         )
 
@@ -166,18 +202,30 @@ def get_google_news(keyword):
         articles.append(
             {
                 "title": title,
-                "link": entry.get("link", ""),
-                "published": entry.get("published", ""),
-                "published_timestamp": published_timestamp,
-                "source": source or "출처 정보 없음",
+                "link": entry.get(
+                    "link",
+                    "",
+                ),
+                "published": entry.get(
+                    "published",
+                    "",
+                ),
+                "published_timestamp":
+                    published_timestamp,
+                "source":
+                    source
+                    or "출처 정보 없음",
 
-                # 어떤 검색어에서 발견됐는지 기록만 함
-                # 점수 계산에는 사용하지 않음
+                # 검색에 사용된 키워드는
+                # 기록만 하고 점수에는 사용하지 않음
                 "keyword": keyword,
             }
         )
 
-        if len(articles) >= NEWS_PER_KEYWORD:
+        if (
+            len(articles)
+            >= NEWS_PER_KEYWORD
+        ):
             break
 
     return articles
@@ -262,7 +310,7 @@ IMPORTANT_TERMS = {
 }
 
 
-# 주가·증권 중심 기사는 강한 감점
+# 주가·증권 중심 기사 감점
 EXCLUDE_TERMS = [
     "주가",
     "급등",
@@ -275,20 +323,26 @@ EXCLUDE_TERMS = [
 
 def relevance_score(article):
     """
-    기사 제목만 이용해 관련도를 계산하고,
-    최신 기사에 소량의 가중치를 추가한다.
+    기사 제목을 이용해 관련도를 계산하고
+    최신 기사에는 추가 점수를 준다.
     """
 
-    # 검색 키워드는 제외
-    text = article["title"].lower()
+    # 검색 키워드는 점수 계산에서 제외
+    text = article[
+        "title"
+    ].lower()
 
     score = 0
 
     # -----------------------------------------------------
-    # 업무 관련성 점수
+    # 업무 관련성
     # -----------------------------------------------------
 
-    for term, weight in IMPORTANT_TERMS.items():
+    for (
+        term,
+        weight,
+    ) in IMPORTANT_TERMS.items():
+
         if term.lower() in text:
             score += weight
 
@@ -297,19 +351,22 @@ def relevance_score(article):
     # -----------------------------------------------------
 
     for term in EXCLUDE_TERMS:
+
         if term.lower() in text:
             score -= 10
 
     # -----------------------------------------------------
     # 최신성 점수
     #
-    # 오늘 기사    → 약 +2점
-    # 3~4일 전    → 약 +1점
-    # 7일 전      → 약 +0점
+    # 오늘 기사 → 약 +2
+    # 3~4일 전 → 약 +1
+    # 7일 전   → 약 +0
     # -----------------------------------------------------
 
     timestamp = (
-        article.get("published_timestamp")
+        article.get(
+            "published_timestamp"
+        )
         or 0
     )
 
@@ -317,8 +374,13 @@ def relevance_score(article):
 
     if timestamp:
         age_days = (
-            time.time() - timestamp
-        ) / (24 * 60 * 60)
+            time.time()
+            - timestamp
+        ) / (
+            24
+            * 60
+            * 60
+        )
 
         age_days = max(
             0,
@@ -327,33 +389,137 @@ def relevance_score(article):
 
         freshness_score = max(
             0,
-            2 * (
+            2
+            * (
                 1
-                - age_days / LOOKBACK_DAYS
+                - (
+                    age_days
+                    / LOOKBACK_DAYS
+                )
             ),
         )
 
-    return score + freshness_score
+    return (
+        score
+        + freshness_score
+    )
 
 
 # =========================================================
-# 4. 최종 뉴스 선정
+# 4. 뉴스 카테고리 분류
+# =========================================================
+
+def classify_category(article):
+    """
+    기사 제목을 기준으로
+    간단한 카테고리 분류
+    """
+
+    title = article[
+        "title"
+    ].lower()
+
+    # -----------------------------------------------------
+    # 개발자 교육
+    # -----------------------------------------------------
+
+    developer_education_terms = [
+        "developer education",
+        "developer training",
+        "coding education",
+        "개발자 교육",
+        "개발자 훈련",
+        "코딩 교육",
+    ]
+
+    if any(
+        term in title
+        for term
+        in developer_education_terms
+    ):
+        return "DEVELOPER_EDUCATION"
+
+    # -----------------------------------------------------
+    # AI 교육 / 평가
+    # -----------------------------------------------------
+
+    ai_education_terms = [
+        "ai tutor",
+        "ai 튜터",
+        "personalized learning",
+        "개인화 학습",
+        "ai assessment",
+        "교육 평가",
+        "학습 평가",
+        "ai education",
+        "ai 교육",
+    ]
+
+    if any(
+        term in title
+        for term
+        in ai_education_terms
+    ):
+        return "AI_EDUCATION"
+
+    # -----------------------------------------------------
+    # AI Agent
+    # -----------------------------------------------------
+
+    agent_terms = [
+        "coding agent",
+        "코딩 에이전트",
+        "computer use",
+        "ai agent",
+        "ai 에이전트",
+        "agent",
+        "에이전트",
+    ]
+
+    if any(
+        term in title
+        for term
+        in agent_terms
+    ):
+        return "AI_AGENT"
+
+    # -----------------------------------------------------
+    # 그 외 AI / LLM
+    # -----------------------------------------------------
+
+    return "AI_GENERAL"
+
+
+# =========================================================
+# 5. 최종 뉴스 선정
 # =========================================================
 
 def select_news(articles):
     """
-    관련도 + 최신성 점수가 높은 순으로
-    최종 뉴스를 선정한다.
+    관련도 + 최신성 점수가 높은 순으로 선정하되
+    동일 카테고리는 최대 3개까지만 선정한다.
     """
 
     scored_articles = []
 
-    for article in articles:
-        score = relevance_score(article)
+    # -----------------------------------------------------
+    # 점수 + 카테고리 계산
+    # -----------------------------------------------------
 
-        # 관련성이 거의 없는 뉴스 제거
+    for article in articles:
+        score = relevance_score(
+            article
+        )
+
+        # 관련성이 거의 없는 뉴스 제외
         if score <= 0:
             continue
+
+        article["category"] = (
+            classify_category(
+                article
+            )
+        )
 
         scored_articles.append(
             (
@@ -362,31 +528,77 @@ def select_news(articles):
             )
         )
 
+    # -----------------------------------------------------
+    # 정렬
+    #
     # 1순위: 관련도 + 최신성 점수
     # 2순위: 발행 시간
+    # -----------------------------------------------------
+
     scored_articles.sort(
         key=lambda item: (
             item[1],
             item[0].get(
                 "published_timestamp"
-            ) or 0,
+            )
+            or 0,
         ),
         reverse=True,
     )
 
-    selected = [
-        article
-        for article, _
-        in scored_articles[
-            :MAX_SELECTED_NEWS
+    # -----------------------------------------------------
+    # 카테고리 쏠림 방지
+    # -----------------------------------------------------
+
+    selected = []
+
+    category_count = {}
+
+    for (
+        article,
+        score,
+    ) in scored_articles:
+
+        category = article[
+            "category"
         ]
-    ]
+
+        current_count = (
+            category_count.get(
+                category,
+                0,
+            )
+        )
+
+        # 동일 카테고리 최대 3개
+        if (
+            current_count
+            >= MAX_NEWS_PER_CATEGORY
+        ):
+            continue
+
+        selected.append(
+            article
+        )
+
+        category_count[
+            category
+        ] = (
+            current_count
+            + 1
+        )
+
+        if (
+            len(selected)
+            >= MAX_SELECTED_NEWS
+        ):
+            break
 
     return selected
 
 
 # =========================================================
-# 5. Slack Block Kit
+# 6. Slack Block Kit
 # =========================================================
 
 def build_slack_blocks(articles):
@@ -420,10 +632,14 @@ def build_slack_blocks(articles):
         },
     ]
 
-    for index, article in enumerate(
+    for (
+        index,
+        article,
+    ) in enumerate(
         articles,
         1,
     ):
+
         article_link = (
             f"<{article['link']}|"
             f"🔗 기사 읽기>"
@@ -437,14 +653,14 @@ def build_slack_blocks(articles):
             )
         )
 
-        # 긴 제목 축약
         title = shorten_title(
             article["title"]
         )
 
         text = (
             f"*{index}. {title}*\n"
-            f"_출처: {article['source']} "
+            f"_출처: "
+            f"{article['source']} "
             f"· {published_date}_\n"
             f"{article_link}"
         )
@@ -469,7 +685,7 @@ def build_slack_blocks(articles):
 
 
 # =========================================================
-# 6. Slack 전송
+# 7. Slack 전송
 # =========================================================
 
 def send_slack(articles):
@@ -491,8 +707,10 @@ def send_slack(articles):
             "☁️ AI & Education "
             "Weekly Briefing"
         ),
-        "blocks": build_slack_blocks(
-            articles
+        "blocks": (
+            build_slack_blocks(
+                articles
+            )
         ),
     }
 
@@ -514,11 +732,17 @@ def send_slack(articles):
 # =========================================================
 
 def main():
-    print("=" * 60)
+    print(
+        "=" * 60
+    )
+
     print(
         "AI & Education Weekly News"
     )
-    print("=" * 60)
+
+    print(
+        "=" * 60
+    )
 
     all_articles = []
 
@@ -579,7 +803,7 @@ def main():
         return
 
     # -----------------------------------------------------
-    # 뉴스 선정
+    # 최종 선정
     # -----------------------------------------------------
 
     selected_articles = (
@@ -589,26 +813,36 @@ def main():
     )
 
     print(
-        f"최종 선정: "
+        f"\n최종 선정: "
         f"{len(selected_articles)}개"
     )
 
     # -----------------------------------------------------
-    # 선정 결과 확인
+    # 결과 확인
     # -----------------------------------------------------
 
-    for index, article in enumerate(
+    for (
+        index,
+        article,
+    ) in enumerate(
         selected_articles,
         1,
     ):
+
         score = relevance_score(
             article
         )
 
         print()
+
         print(
             f"{index}. "
             f"{article['title']}"
+        )
+
+        print(
+            f"   카테고리: "
+            f"{article['category']}"
         )
 
         print(
@@ -627,7 +861,7 @@ def main():
         )
 
     # -----------------------------------------------------
-    # Slack 전송
+    # Slack
     # -----------------------------------------------------
 
     send_slack(
