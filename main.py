@@ -1,5 +1,4 @@
 import calendar
-import html
 import os
 import re
 import time
@@ -16,7 +15,7 @@ from dotenv import load_dotenv
 # =========================================================
 
 # 로컬 테스트에서는 .env 사용
-# GitHub Actions에서는 Repository Secret을 환경 변수로 전달
+# GitHub Actions에서는 Repository Secret 사용
 load_dotenv()
 
 SLACK_WEBHOOK_URL = os.getenv("SLACK_WEBHOOK_URL")
@@ -46,25 +45,22 @@ KEYWORDS = [
     "AI developer training",
 ]
 
+# 검색어별 최대 수집 개수
 NEWS_PER_KEYWORD = 8
+
+# Slack에 보낼 뉴스 개수
 MAX_SELECTED_NEWS = 5
+
+# 최근 며칠 기사까지 볼지
 LOOKBACK_DAYS = 7
+
+# Slack에 표시할 기사 제목 최대 길이
+MAX_TITLE_LENGTH = 80
 
 
 # =========================================================
 # 공통
 # =========================================================
-
-def clean_html_text(text):
-    if not text:
-        return ""
-
-    text = html.unescape(text)
-    text = re.sub(r"<[^>]+>", " ", text)
-    text = re.sub(r"\s+", " ", text)
-
-    return text.strip()
-
 
 def clean_title(title, source):
     """Google News 제목 뒤의 ' - 출처명' 제거"""
@@ -81,6 +77,8 @@ def clean_title(title, source):
 
 
 def normalize_title(title):
+    """중복 비교를 위한 제목 정규화"""
+
     title = title.lower()
     title = re.sub(r"[^가-힣a-z0-9\s]", "", title)
     title = re.sub(r"\s+", " ", title)
@@ -88,7 +86,18 @@ def normalize_title(title):
     return title.strip()
 
 
+def shorten_title(title, max_length=MAX_TITLE_LENGTH):
+    """Slack에서 너무 긴 제목 축약"""
+
+    if len(title) <= max_length:
+        return title
+
+    return title[:max_length].rstrip() + "..."
+
+
 def format_published_date(article):
+    """timestamp를 YYYY-MM-DD 형식으로 변환"""
+
     timestamp = article.get("published_timestamp")
 
     if not timestamp:
@@ -118,12 +127,18 @@ def get_google_news(keyword):
     feed = feedparser.parse(url)
 
     articles = []
+
     current_time = time.time()
-    cutoff = current_time - (LOOKBACK_DAYS * 24 * 60 * 60)
+
+    cutoff = (
+        current_time
+        - (LOOKBACK_DAYS * 24 * 60 * 60)
+    )
 
     for entry in feed.entries:
         published_timestamp = None
 
+        # 최근 LOOKBACK_DAYS 이내 기사만 사용
         if entry.get("published_parsed"):
             published_timestamp = calendar.timegm(
                 entry.published_parsed
@@ -135,7 +150,10 @@ def get_google_news(keyword):
         source = ""
 
         if entry.get("source"):
-            source = entry.source.get("title", "")
+            source = entry.source.get(
+                "title",
+                "",
+            )
 
         title = clean_title(
             entry.get("title", ""),
@@ -152,6 +170,9 @@ def get_google_news(keyword):
                 "published": entry.get("published", ""),
                 "published_timestamp": published_timestamp,
                 "source": source or "출처 정보 없음",
+
+                # 어떤 검색어에서 발견됐는지 기록만 함
+                # 점수 계산에는 사용하지 않음
                 "keyword": keyword,
             }
         )
@@ -171,9 +192,14 @@ def remove_duplicates(articles):
     result = []
 
     for article in articles:
-        normalized = normalize_title(article["title"])
+        normalized = normalize_title(
+            article["title"]
+        )
 
-        if not normalized or normalized in seen:
+        if not normalized:
+            continue
+
+        if normalized in seen:
             continue
 
         seen.add(normalized)
@@ -183,27 +209,60 @@ def remove_duplicates(articles):
 
 
 # =========================================================
-# 3. LLM 없는 규칙 기반 뉴스 선정
+# 3. 규칙 기반 관련도 점수
 # =========================================================
 
 IMPORTANT_TERMS = {
-    "agent": 4,
+    # Agent
     "coding agent": 5,
+    "코딩 에이전트": 5,
+
     "computer use": 5,
+    "computer use agent": 5,
+    "컴퓨터 유즈": 5,
+
+    "ai agent": 4,
+    "ai 에이전트": 4,
+
+    "agent": 3,
+    "에이전트": 3,
+
+    # Developer Tool
     "developer tool": 4,
+    "개발자 도구": 4,
+
+    # AI Education
     "ai tutor": 5,
+    "ai 튜터": 5,
+
     "personalized learning": 4,
+    "개인화 학습": 4,
+
     "assessment": 4,
     "평가": 4,
-    "교육": 3,
+
+    # Developer Education
     "developer education": 4,
     "개발자 교육": 4,
+
+    "coding education": 4,
+    "코딩 교육": 4,
+
+    # LLM / GenAI
     "llm": 3,
+    "대규모 언어 모델": 3,
+
     "생성형 ai": 3,
+    "generative ai": 3,
+
     "artificial intelligence": 2,
+
+    # 일반적인 AI 언급은 낮은 점수
     "ai": 1,
 }
 
+
+# 주가·증권 중심 기사는 강한 감점
 EXCLUDE_TERMS = [
     "주가",
     "급등",
@@ -215,48 +274,119 @@ EXCLUDE_TERMS = [
 
 
 def relevance_score(article):
-    """제목 + 검색 키워드를 기준으로 단순 관련도 점수 계산"""
+    """
+    기사 제목만 이용해 관련도를 계산하고,
+    최신 기사에 소량의 가중치를 추가한다.
+    """
 
-    text = (
-        f"{article['title']} "
-        f"{article.get('keyword', '')}"
-    ).lower()
+    # 검색 키워드는 제외
+    text = article["title"].lower()
 
     score = 0
+
+    # -----------------------------------------------------
+    # 업무 관련성 점수
+    # -----------------------------------------------------
 
     for term, weight in IMPORTANT_TERMS.items():
         if term.lower() in text:
             score += weight
 
+    # -----------------------------------------------------
+    # 불필요한 기사 감점
+    # -----------------------------------------------------
+
     for term in EXCLUDE_TERMS:
         if term.lower() in text:
             score -= 10
 
-    timestamp = article.get("published_timestamp") or 0
+    # -----------------------------------------------------
+    # 최신성 점수
+    #
+    # 오늘 기사    → 약 +2점
+    # 3~4일 전    → 약 +1점
+    # 7일 전      → 약 +0점
+    # -----------------------------------------------------
 
-    return score, timestamp
-
-
-def select_news(articles):
-    """LLM 대신 규칙 기반으로 관련도 높은 뉴스 선정"""
-
-    ranked = sorted(
-        articles,
-        key=relevance_score,
-        reverse=True,
+    timestamp = (
+        article.get("published_timestamp")
+        or 0
     )
 
-    ranked = [
-        article
-        for article in ranked
-        if relevance_score(article)[0] >= 0
-    ]
+    freshness_score = 0
 
-    return ranked[:MAX_SELECTED_NEWS]
+    if timestamp:
+        age_days = (
+            time.time() - timestamp
+        ) / (24 * 60 * 60)
+
+        age_days = max(
+            0,
+            age_days,
+        )
+
+        freshness_score = max(
+            0,
+            2 * (
+                1
+                - age_days / LOOKBACK_DAYS
+            ),
+        )
+
+    return score + freshness_score
 
 
 # =========================================================
-# 4. Slack Block Kit
+# 4. 최종 뉴스 선정
+# =========================================================
+
+def select_news(articles):
+    """
+    관련도 + 최신성 점수가 높은 순으로
+    최종 뉴스를 선정한다.
+    """
+
+    scored_articles = []
+
+    for article in articles:
+        score = relevance_score(article)
+
+        # 관련성이 거의 없는 뉴스 제거
+        if score <= 0:
+            continue
+
+        scored_articles.append(
+            (
+                article,
+                score,
+            )
+        )
+
+    # 1순위: 관련도 + 최신성 점수
+    # 2순위: 발행 시간
+    scored_articles.sort(
+        key=lambda item: (
+            item[1],
+            item[0].get(
+                "published_timestamp"
+            ) or 0,
+        ),
+        reverse=True,
+    )
+
+    selected = [
+        article
+        for article, _
+        in scored_articles[
+            :MAX_SELECTED_NEWS
+        ]
+    ]
+
+    return selected
+
+
+# =========================================================
+# 5. Slack Block Kit
 # =========================================================
 
 def build_slack_blocks(articles):
@@ -265,7 +395,10 @@ def build_slack_blocks(articles):
             "type": "header",
             "text": {
                 "type": "plain_text",
-                "text": "☁️ AI & Education Weekly Briefing",
+                "text": (
+                    "☁️ AI & Education "
+                    "Weekly Briefing"
+                ),
                 "emoji": True,
             },
         },
@@ -275,26 +408,44 @@ def build_slack_blocks(articles):
                 "type": "mrkdwn",
                 "text": (
                     "🔥 *이번 주 주요 뉴스*\n"
-                    f"AI · Agent · 교육 · 개발자 교육 관련 "
-                    f"뉴스 {len(articles)}개를 모았습니다."
+                    "AI · Agent · 교육 · "
+                    "개발자 교육 관련 "
+                    f"뉴스 {len(articles)}개를 "
+                    "모았습니다."
                 ),
             },
         },
-        {"type": "divider"},
+        {
+            "type": "divider",
+        },
     ]
 
-    for index, article in enumerate(articles, 1):
+    for index, article in enumerate(
+        articles,
+        1,
+    ):
         article_link = (
-            f"<{article['link']}|🔗 기사 읽기>"
+            f"<{article['link']}|"
+            f"🔗 기사 읽기>"
             if article.get("link")
             else "기사 링크 없음"
         )
 
-        published_date = format_published_date(article)
+        published_date = (
+            format_published_date(
+                article
+            )
+        )
+
+        # 긴 제목 축약
+        title = shorten_title(
+            article["title"]
+        )
 
         text = (
-            f"*{index}. {article['title']}*\n"
-            f"_출처: {article['source']} · {published_date}_\n"
+            f"*{index}. {title}*\n"
+            f"_출처: {article['source']} "
+            f"· {published_date}_\n"
             f"{article_link}"
         )
 
@@ -308,29 +459,41 @@ def build_slack_blocks(articles):
             }
         )
 
-        blocks.append({"type": "divider"})
+        blocks.append(
+            {
+                "type": "divider",
+            }
+        )
 
     return blocks
 
 
 # =========================================================
-# 5. Slack 전송
+# 6. Slack 전송
 # =========================================================
 
 def send_slack(articles):
     if not SLACK_WEBHOOK_URL:
         raise RuntimeError(
             "SLACK_WEBHOOK_URL이 없습니다. "
-            "GitHub Repository Secret 또는 .env를 확인하세요."
+            "GitHub Repository Secret 또는 "
+            ".env를 확인하세요."
         )
 
     if not articles:
-        print("Slack으로 보낼 뉴스가 없습니다.")
+        print(
+            "Slack으로 보낼 뉴스가 없습니다."
+        )
         return
 
     payload = {
-        "text": "☁️ AI & Education Weekly Briefing",
-        "blocks": build_slack_blocks(articles),
+        "text": (
+            "☁️ AI & Education "
+            "Weekly Briefing"
+        ),
+        "blocks": build_slack_blocks(
+            articles
+        ),
     }
 
     response = requests.post(
@@ -341,7 +504,9 @@ def send_slack(articles):
 
     response.raise_for_status()
 
-    print("✅ Slack 전송 완료")
+    print(
+        "✅ Slack 전송 완료"
+    )
 
 
 # =========================================================
@@ -350,42 +515,124 @@ def send_slack(articles):
 
 def main():
     print("=" * 60)
-    print("AI & Education Weekly News")
+    print(
+        "AI & Education Weekly News"
+    )
     print("=" * 60)
 
     all_articles = []
 
-    print(f"\n최근 {LOOKBACK_DAYS}일 뉴스 수집 시작\n")
+    print(
+        f"\n최근 {LOOKBACK_DAYS}일 "
+        "뉴스 수집 시작\n"
+    )
+
+    # -----------------------------------------------------
+    # 뉴스 수집
+    # -----------------------------------------------------
 
     for keyword in KEYWORDS:
-        print(f"[검색] {keyword}")
+        print(
+            f"[검색] {keyword}"
+        )
 
         try:
-            articles = get_google_news(keyword)
-            print(f"      → {len(articles)}개")
-            all_articles.extend(articles)
+            articles = (
+                get_google_news(
+                    keyword
+                )
+            )
+
+            print(
+                f"      → "
+                f"{len(articles)}개"
+            )
+
+            all_articles.extend(
+                articles
+            )
 
         except Exception as e:
-            print(f"      → 오류: {e}")
+            print(
+                f"      → 오류: {e}"
+            )
 
-    all_articles = remove_duplicates(all_articles)
+    # -----------------------------------------------------
+    # 중복 제거
+    # -----------------------------------------------------
 
-    print(f"\n중복 제거 후 뉴스: {len(all_articles)}개")
+    all_articles = (
+        remove_duplicates(
+            all_articles
+        )
+    )
+
+    print(
+        f"\n중복 제거 후 뉴스: "
+        f"{len(all_articles)}개"
+    )
 
     if not all_articles:
-        print("최근 뉴스가 없습니다.")
+        print(
+            "최근 뉴스가 없습니다."
+        )
         return
 
-    selected_articles = select_news(all_articles)
+    # -----------------------------------------------------
+    # 뉴스 선정
+    # -----------------------------------------------------
 
-    print(f"최종 선정: {len(selected_articles)}개")
+    selected_articles = (
+        select_news(
+            all_articles
+        )
+    )
 
-    for index, article in enumerate(selected_articles, 1):
-        print(f"{index}. {article['title']}")
-        print(f"   {article['source']}")
-        print(f"   {article['link']}")
+    print(
+        f"최종 선정: "
+        f"{len(selected_articles)}개"
+    )
 
-    send_slack(selected_articles)
+    # -----------------------------------------------------
+    # 선정 결과 확인
+    # -----------------------------------------------------
+
+    for index, article in enumerate(
+        selected_articles,
+        1,
+    ):
+        score = relevance_score(
+            article
+        )
+
+        print()
+        print(
+            f"{index}. "
+            f"{article['title']}"
+        )
+
+        print(
+            f"   점수: "
+            f"{score:.2f}"
+        )
+
+        print(
+            f"   출처: "
+            f"{article['source']}"
+        )
+
+        print(
+            f"   URL: "
+            f"{article['link']}"
+        )
+
+    # -----------------------------------------------------
+    # Slack 전송
+    # -----------------------------------------------------
+
+    send_slack(
+        selected_articles
+    )
 
 
 if __name__ == "__main__":
